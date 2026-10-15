@@ -89,18 +89,46 @@ impl Emitter {
                 Ok(())
             }
             Stmt::Break { label, .. } => {
-                // `break loop` → Go label `hyLoop` (`loop` is a Go keyword).
-                // The enclosing loop labels itself when it owns a labeled
-                // break — see emit_for.
+                // `break loop` → the Go label of the innermost labeled
+                // loop in THIS function (pr-136's per-loop labels), refused
+                // when no enclosing loop exists at all (pr-101: the label
+                // would have no target — the checker rejects fn bodies with
+                // HYB-E3010; this guards closure bodies).
                 match label {
-                    Some(_) => self.push("break hyLoop"),
+                    Some(_) => {
+                        if self.for_depth == 0 && self.loop_labels.is_empty() {
+                            return Err(EmitError::unsupported(
+                                "`break loop` with no enclosing loop in this function or closure \
+                                 — the loop label would have no target (LX14)",
+                            ));
+                        }
+                        let name = self
+                            .loop_labels
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| "hyLoop".to_string());
+                        self.push(&format!("break {}", name));
+                    }
                     None => self.push("break"),
                 }
                 Ok(())
             }
             Stmt::Continue { label, .. } => {
                 match label {
-                    Some(_) => self.push("continue hyLoop"),
+                    Some(_) => {
+                        if self.for_depth == 0 && self.loop_labels.is_empty() {
+                            return Err(EmitError::unsupported(
+                                "`continue loop` with no enclosing loop in this function or \
+                                 closure — the loop label would have no target (LX14)",
+                            ));
+                        }
+                        let name = self
+                            .loop_labels
+                            .last()
+                            .cloned()
+                            .unwrap_or_else(|| "hyLoop".to_string());
+                        self.push(&format!("continue {}", name));
+                    }
                     None => self.push("continue"),
                 }
                 Ok(())
@@ -908,10 +936,32 @@ impl Emitter {
         // inside a nested loop — that one labels itself) makes this loop the
         // Go label target: `hyLoop:` + the for head, `break hyLoop` inside.
         let needs_label = self.block_has_loop_break(body);
+        // Two sibling loops each owning a `break loop` would both declare
+        // `hyLoop:` — Go rejects that (`label hyLoop already declared`), and
+        // no emission can fix a duplicate declaration, so each labeled loop
+        // takes a fresh name (`hyLoop`, `hyLoop1`, …). The label is pushed
+        // BEFORE the body renders (so the breaks inside pick it up) and
+        // pushed/pop popped around the body.
+        let label = if needs_label {
+            // A per-function counter, not the stack depth: sibling loops
+            // unwind the stack between them, so depth would hand both the
+            // same name.
+            let n = self.loop_label_n;
+            self.loop_label_n += 1;
+            let name = if n == 0 {
+                "hyLoop".to_string()
+            } else {
+                format!("hyLoop{}", n)
+            };
+            self.loop_labels.push(name.clone());
+            Some(name)
+        } else {
+            None
+        };
         // gofmt puts a loop label on its OWN line (`hyLoop:` then the for
         // head one level in) — emit it as a separate line, never inline.
-        if needs_label {
-            self.push("hyLoop:");
+        if let Some(l) = &label {
+            self.push(&format!("{}:", l));
         }
         let head = match kind {
             ForKind::Infinite => "for {".to_string(),
@@ -987,7 +1037,30 @@ impl Emitter {
                             }
                         }
                     }
-                    2 => format!("for {}, {} := range {} {{", vars[0], vars[1], e),
+                    2 => {
+                        // Go rejects a range binding the body never reads
+                        // (`declared and not used`), and `for _, _ :=` is
+                        // itself invalid (`no new variables on left side of
+                        // :=`) - so an unread slot lowers to `_`, and a body
+                        // that reads neither binding drops the list entirely.
+                        // Same lowering the one-variable form already uses.
+                        // Issue #139.
+                        let a = if crate::rangebind::body_reads(body, &vars[0]) {
+                            vars[0].clone()
+                        } else {
+                            "_".to_string()
+                        };
+                        let c = if crate::rangebind::body_reads(body, &vars[1]) {
+                            vars[1].clone()
+                        } else {
+                            "_".to_string()
+                        };
+                        if a == "_" && c == "_" {
+                            format!("for range {} {{", e)
+                        } else {
+                            format!("for {}, {} := range {} {{", a, c, e)
+                        }
+                    }
                     n => {
                         return Err(EmitError::unsupported(format!(
                             "for-in with {} loop variables",
@@ -999,8 +1072,14 @@ impl Emitter {
             }
         };
         self.push(&head);
-        self.emit_block_body(&body.stmts)?;
+        self.for_depth += 1;
+        let body_r = self.emit_block_body(&body.stmts);
+        self.for_depth -= 1;
+        body_r?;
         self.push("}");
+        if label.is_some() {
+            self.loop_labels.pop();
+        }
         Ok(())
     }
 
@@ -1032,6 +1111,13 @@ impl Emitter {
             Stmt::For { .. } => false, // nested loop labels itself
             Stmt::Block { block, .. } | Stmt::Managed { body: block, .. } => {
                 self.block_has_loop_break(block)
+            }
+            Stmt::Match { arms, .. } => {
+                // A labeled break/continue inside a match arm still targets
+                // THIS loop (the arm is not a new loop) — without this arm
+                // the loop skipped its `hyLoop:` label and the emitted
+                // `break hyLoop` failed go vet (invalid break label).
+                arms.iter().any(|a| self.block_has_loop_break(&a.body))
             }
             Stmt::Select { arms, .. } => arms.iter().any(|a| self.block_has_loop_break(&a.body)),
             _ => false,

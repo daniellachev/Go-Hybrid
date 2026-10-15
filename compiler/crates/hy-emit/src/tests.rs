@@ -599,6 +599,56 @@ fn inclusive_range_and_labeled_break() {
 }
 
 #[test]
+fn sibling_labeled_loops_get_distinct_go_labels() {
+    // Two SIBLING loops that each own a `break loop` are both legal source
+    // (LX14 binds each label to its own loop), but a fixed `hyLoop` name
+    // emitted two declarations → `go vet`: "label hyLoop already declared",
+    // so an accepted program could never build.
+    let go = emit(
+        "fn main() {\n    for i in 0..2 {\n        break loop\n    }\n    for j in 0..2 {\n        break loop\n    }\n}\n",
+    );
+    assert_eq!(
+        go.matches("hyLoop:").count(),
+        1,
+        "outer label keeps the canonical name:\n{}",
+        go
+    );
+    assert_eq!(
+        go.matches("hyLoop1:").count(),
+        1,
+        "the sibling gets a fresh label:\n{}",
+        go
+    );
+    assert!(!go.contains("hyLoop2"), "no wasted label counter:\n{}", go);
+    assert!(go.contains("break hyLoop\n"), ":\n{}", go);
+    assert!(go.contains("break hyLoop1\n"), ":\n{}", go);
+}
+
+#[test]
+fn nested_labeled_loops_break_their_own_loop() {
+    // A labeled `break loop` inside a NESTED loop targets the nested loop
+    // (LX14), so each level carries its own label and each break must name
+    // the one it is lexically inside.
+    let go = emit(
+        "fn main() {\n    for i in 0..2 {\n        for j in 0..2 {\n            break loop\n        }\n        break loop\n    }\n}\n",
+    );
+    assert_eq!(go.matches("hyLoop:").count(), 1, ":\n{}", go);
+    assert_eq!(go.matches("hyLoop1:").count(), 1, ":\n{}", go);
+    assert_eq!(
+        go.matches("break hyLoop1").count(),
+        1,
+        "the nested break names the nested loop:\n{}",
+        go
+    );
+    assert_eq!(
+        go.matches("break hyLoop\n").count(),
+        1,
+        "the outer break names the outer loop:\n{}",
+        go
+    );
+}
+
+#[test]
 fn exclusive_range_stays_exclusive() {
     let go = emit("fn main() {\n    for i in 0..n {\n    }\n}\n");
     assert!(go.contains("for i := 0; i < n; i++ {"), ":\n{}", go);
@@ -1241,6 +1291,7 @@ fn diff_duplicate_hyerr_assign_gone() {
 }
 
 // ---------------------------------------------------------------------------
+
 // The unbound-crate refusal (the adoption-audit flate2 follow-up)
 // ---------------------------------------------------------------------------
 
@@ -1275,4 +1326,136 @@ fn unbound_crate_import_refused_honestly() {
         "honest message expected:\n{}",
         msg
     );
+}
+
+// ---------------------------------------------------------------------------
+// issue #139 - an accepted `for i, v in xs` whose binding is never read used
+// to emit Go that cannot build (`declared and not used`; and
+// `no new variables on left side of :=` when neither binding is read).
+// ---------------------------------------------------------------------------
+
+fn range_src(isi: &str) -> String {
+    format!(
+        "fn main() {{\n    xs := []int{{1, 2, 3}}\n    t := 0\n    for i, v in xs {{\n        {}\n    }}\n    fmt.println(\"{{t}}\")\n}}\n",
+        isi
+    )
+}
+
+#[test]
+fn range_binding_never_read_drops_to_blank() {
+    let go = emit(&range_src("t = t + i"));
+    assert!(
+        go.contains("for i, _ := range xs {"),
+        "unread second binding must be `_`:\n{}",
+        go
+    );
+}
+
+#[test]
+fn range_binding_only_second_read_drops_first_to_blank() {
+    let go = emit(&range_src("t = t + v"));
+    assert!(
+        go.contains("for _, v := range xs {"),
+        "unread first binding must be `_`:\n{}",
+        go
+    );
+}
+
+#[test]
+fn range_binding_both_read_stays_intact() {
+    let go = emit(&range_src("t = t + i + v"));
+    assert!(
+        go.contains("for i, v := range xs {"),
+        "both bindings read must be untouched:\n{}",
+        go
+    );
+}
+
+#[test]
+fn range_binding_neither_read_drops_the_binding_list() {
+    // `for _, _ := range xs` is still invalid Go, so both-unread has to drop
+    // the binding list entirely.
+    let go = emit("fn main() {\n    xs := []int{1, 2, 3}\n    for i, v in xs {\n        fmt.println(\"x\")\n    }\n}\n");
+    assert!(
+        go.contains("for range xs {"),
+        "both bindings unread must drop the list:\n{}",
+        go
+    );
+    assert!(!go.contains("_, _"), "must not emit `_, _`:\n{}", go);
+}
+
+#[test]
+fn range_binding_mention_inside_a_closure_counts_as_read() {
+    // A mention anywhere - a closure included - must suppress the `_`, since
+    // only the conservative direction is safe.
+    let go = emit("fn main() {\n    xs := []int{1, 2, 3}\n    f := fn() {\n        fmt.println(\"x\")\n    }\n    for i, v in xs {\n        f()\n        fmt.println(\"{v}\")\n    }\n}\n");
+    assert!(
+        go.contains("for _, v := range xs {"),
+        "a closure mention is still a read:\n{}",
+        go
+    );
+    assert!(
+        go.contains("%v") && go.contains("for _, v := range xs {"),
+        "the READ binding v must stay a real binding:\n{}",
+        go
+    );
+}
+
+// Loop-label scope (HYB-E3010 companion; issue: break/continue loop with no
+// enclosing loop / match-arm label propagation)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn match_arm_labeled_break_labels_enclosing_loop() {
+    // stmt_has_loop_break used to skip Stmt::Match, so a `break loop` inside
+    // a match arm left the loop unlabeled and the emitted `break hyLoop`
+    // failed go vet (invalid break label). The arm is not a new loop — the
+    // enclosing loop must carry the hyLoop label.
+    let go = emit(
+        "fn main() {\n    o := some(1)\n    loop {\n        match o {\n            some(v) => if v > 0 { break loop }\n            none => {}\n        }\n    }\n}\n",
+    );
+    assert!(go.contains("hyLoop:"), "label missing:\n{}", go);
+    assert!(go.contains("break hyLoop"), ":\n{}", go);
+}
+
+#[test]
+fn match_arm_labeled_continue_labels_enclosing_while_for() {
+    let go = emit(
+        "fn main() {\n    o := some(1)\n    x := 1\n    for x > 0 {\n        match o {\n            some(v) => if v > 0 { continue loop }\n            none => {}\n        }\n    }\n}\n",
+    );
+    assert!(go.contains("hyLoop:"), "label missing:\n{}", go);
+    assert!(go.contains("continue hyLoop"), ":\n{}", go);
+}
+
+#[test]
+fn closure_labeled_break_without_closure_loop_refuses_emit() {
+    // Labels do not cross func boundaries: a closure-nested `break loop`
+    // with no loop INSIDE the literal cannot target the outer frame's label
+    // (Go rejects it too). The checker's Tier-0 walk skips closure bodies,
+    // so the emitter is the backstop — refuse instead of emitting
+    // `break hyLoop` against an undefined label.
+    let file = parse_file(
+        "t.hy",
+        "fn main() {\n    f := fn() {\n        break loop\n    }\n    f()\n}\n",
+    )
+    .expect("parse");
+    match super::emit_go(&file) {
+        Ok(g) => panic!("expected unsupported error, got:\n{}", g),
+        Err(e) => assert!(
+            e.message.contains("no enclosing loop"),
+            "message should name the missing loop: {}",
+            e.message
+        ),
+    }
+}
+
+#[test]
+fn closure_with_own_loop_labeled_break_emits() {
+    // Control: a closure that owns its loop labels itself and emits fine.
+    let go = emit(
+        "fn main() {\n    f := fn() {\n        loop {\n            break loop\n        }\n    }\n    f()\n}\n",
+    );
+    assert!(go.contains("hyLoop:"), "label missing:\n{}", go);
+    assert!(go.contains("break hyLoop"), ":\n{}", go);
+
 }

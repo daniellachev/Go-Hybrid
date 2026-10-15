@@ -1,5 +1,7 @@
 # STATUS (for the human — 15 lines max)
 
+- Contributor installer fix (2026-10-15): validate extracted CLI/runtime and smoke CLI before deleting a working installation. Three invalid-upgrade regressions fail on `f99d6d0` and pass patched; healthy upgrade, 8 installer tests, and 19 Python tooling tests pass. Full Go/Rust suites require upstream CI (toolchains unavailable locally).
+
 - Phase: **MVP DONE + v0.1.0 released + community OPEN** — the stale family rebased+merged, audit follow-ups (a)/(b)/(c) LANDED, the bounty PR conveyor running
 - **Stale family (#28/#30/#32/#34, carelessdept) CLOSED by maintainer-assisted rebase**: each PR verified hole-by-hole against the seam first (some subsumed by pr-35's may-share, the rest live), ported through the seam's architecture with the authors' tests intact, CI-validated per head, merged with per-PR seam notes; bounty standing preserved
 - **Audit follow-ups landed**: (a) composite-nil — `job{m: nil}` rejects E4001 at every type-known site incl. inside managed (corpus 28); (b) flate2 early-fail — unshipped crates refuse at emit with the honest message on BOTH shapes, check stays type-pure for the A7 fixture; (c) pin-drift — hyb/build.rs refuses a mismatched bake with the three honest ways out + rerun-if-env-changed kills the stale-bake half
@@ -9,3 +11,4 @@
 - Remaining open PRs (14, triaged queue for next session): #8 (bounty corpus, standing triage), #22 (select default arms), #63 (fuzz exits), #64 (runner hard-setup stop), #65 (installer checksum), #67 (issue #66 option/match/type-alias), #68/#70 (diagnostics wording), #71 (job dispatch arity), #76 (macOS staticlib), #84 (loan-escape O2/O3 returns), #85 (runner SHA mismatch), #88 (issue #87 multi-unpack aliases), #90 (issue #69 jsonbinding unescape)
 - Standing work: the 14-PR queue above (repro-verify → port-or-close with credit, the same conveyor discipline) · community replies as they arrive · release republish when the conveyor quiets down
 - Last review gate: G3 PASSED 2026-10-13; community review is a standing input to the queue
+- External candidate (Reacx Research, 2026-10-14; PR#22 pending review): contextual `select default` + six regressions + corpus25–28; combined main2e79213 local Rust1.99workspace244/0, corpus28/28, six CLI tests, new accepted26/28 build/run on Go1.26.9 Darwin/arm64; Linux CI/bounty decision pending.

@@ -306,6 +306,11 @@ impl Emitter {
                     self.handler_writer = Some(name);
                 }
                 self.fnlit_depth += 1;
+                // Labels do not cross func boundaries: a labeled break/continue
+                // must find its loop INSIDE the literal — reset the depth so
+                // an outer loop's count cannot bless a closure-nested label.
+                let saved_for_depth = self.for_depth;
+                self.for_depth = 0;
                 let mut out = String::from("func(");
                 out.push_str(&rendered_params);
                 out.push_str(") ");
@@ -335,6 +340,7 @@ impl Emitter {
                 let closure_body = std::mem::take(&mut self.body);
                 self.body = main_body;
                 self.fnlit_depth -= 1;
+                self.for_depth = saved_for_depth;
                 self.handler_writer = saved_writer;
                 self.bindings.retain(|k, _| known.contains(k));
                 out.push_str(&closure_body);
@@ -615,6 +621,35 @@ impl Emitter {
                         ));
                     }
                 }
+            }
+        }
+
+        // --- a SPEC primitive conversion: `u8(300)` -> `uint8(300)`.
+        //     SPEC-LANGUAGE line 1991 states `b := u8(300) // expect: 44`
+        //     as an executable test-claim (§ "Examples are tests"), but the
+        //     name used to fall through to the verbatim emission below and
+        //     die in Go as `undefined: u8`. Issue #147. ---
+        if let Expr::Ident { name, .. } = callee {
+            if let Some(go) = super::shapes::go_primitive_name(name) {
+                if args.len() != 1 {
+                    return Err(EmitError::unsupported(format!(
+                        "`{}` conversion takes exactly one argument",
+                        name
+                    )));
+                }
+                // A CONSTANT operand that does not fit the target has to
+                // be folded here: Go rejects `uint8(300)` outright (the
+                // truncation Go does is only for a variable operand), yet
+                // SPEC-LANGUAGE line 1991 asserts `u8(300) == 44` as an
+                // executable test-claim. The fold computes that same
+                // two's-complement truncation at emit time.
+                if let Some(folded) =
+                    super::constconv::fold_constant(&args[0].value, name)
+                {
+                    return Ok(format!("{}({})", go, folded));
+                }
+                let a = self.emit_call_arg(&args[0])?;
+                return Ok(format!("{}({})", go, a));
             }
         }
 
