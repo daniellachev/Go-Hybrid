@@ -1,10 +1,11 @@
 //! Integration test: EVERY must-parse file parses cleanly.
-//!   * tests/checker-corpus/*.hy            (35 programs — the checker corpus)
-//!   * spikes/spike6-ownership/work/*.hy    (10 programs — Tier-0 rewrites)
+//!
+//!   * tests/checker-corpus/*.hy            (39 programs — the checker corpus)
+//!   * spikes/spike6-ownership/work/*.hy    (10 programs â€” Tier-0 rewrites)
 //!   * examples/01,02,03/program.hy         (MVP-0 target programs)
 //!
-//! plus the stretch examples 04–10 (same surface as the spikes; must parse
-//! or fail cleanly — here we assert they parse too).
+//! plus the stretch examples 04â€“10 (same surface as the spikes; must parse
+//! or fail cleanly â€” here we assert they parse too).
 
 use hy_syntax::parse_file;
 use std::path::PathBuf;
@@ -46,7 +47,7 @@ fn must_parse(path: &PathBuf) {
 #[test]
 fn checker_corpus_all_parse() {
     let files = hy_files_under("tests/checker-corpus");
-    assert_eq!(files.len(), 35, "expected exactly 35 corpus programs",);
+    assert_eq!(files.len(), 39, "expected exactly 39 corpus programs",);
     for f in &files {
         must_parse(f);
     }

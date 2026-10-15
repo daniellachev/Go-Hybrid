@@ -576,6 +576,12 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
         st.scope_pop();
     }
 
+    // #123: closure bodies sit outside Pass B (A5), so process_assign and
+    // process_call never see their writes — scan every FnLit for assign
+    // targets / `delete()` calls through a `const` root with the completed
+    // env (file consts + fn-local consts).
+    ck.check_closure_const_writes(&st, body);
+
     // Closure-boundary pass (closures.rs): task/send/select-send STATEMENTS
     // inside closure bodies are concurrency boundaries in the emitted Go —
     // checked here, fail-closed (O4.9), with the completed function env as
@@ -1120,7 +1126,17 @@ mod tests {
              }",
         );
         assert_eq!(r_closure.verdict, Verdict::Reject);
-        assert_eq!(first_error_rule(&r_closure).as_deref(), Some("A1c"));
+        // AMENDMENT (pr-110 seam): the closure-capture share edge makes the
+        // freeze fire at the MOVE (A1b/E3003) BEFORE the spawn-boundary
+        // A1c/E3001 — both rules must be present, A1b now first. The old
+        // assertion pinned A1c-first because the capture edge did not exist.
+        assert_eq!(first_error_rule(&r_closure).as_deref(), Some("A1b"));
+        assert!(r_closure
+            .diagnostics
+            .iter()
+            .any(|d| d.tier0_rule.as_deref() == Some("A1c")),
+            "the spawn-boundary A1c diagnostic must still fire: {:?}",
+            r_closure.diagnostics);
 
         let r_ptr = check(
             "struct st { n int }\n\
