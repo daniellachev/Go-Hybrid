@@ -338,6 +338,10 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                // N1 for composite literals: `job{m: nil}` carries its own
+                // type context (the struct def / map value / slice elem) —
+                // the nested nil needs no ascription to reject (HYB-E4001).
+                self.check_composite_nils(st, value);
                 // Ascription fills the gaps (O4.9 escape: "make the type
                 // visible to the checker"): when the initializer's shape
                 // does not resolve, the declared type decides. When inference
@@ -409,7 +413,10 @@ impl<'a> Checker<'a> {
     /// Covers the four reported bypass forms: `h2 := h1` (shallow struct/
     /// array copy), `m2 := (agg)` / `s2 := s1[:]` (parenthesized / re-sliced
     /// RHS), `m2 := h1.m` (field/index projection), and `h := holder{m: agg}`
-    /// (composite literal capturing a live binding).
+    /// (composite literal capturing a live binding) — plus the CALL forms of
+    /// #73: a shallow copy or generic identity that returns argument
+    /// storage through `f(...)` (no interprocedural summary, same argument
+    /// as #38's alias recording).
     fn record_may_share(&self, st: &mut FnState, name: &str, value: &Expr) {
         match unwrap_parens(value) {
             Expr::Ident { name: src, .. } => {
@@ -453,17 +460,86 @@ impl<'a> Checker<'a> {
                     self.record_literal_ref(st, name, it);
                 }
             }
+            // A call that hands back storage reachable from an argument
+            // (#73): `h2 := alias_holder(h1)` is a shallow struct copy
+            // through a call — the result shape is `Struct`, which is not a
+            // binding-level alias, so `record_alias`'s reference-shape guard
+            // skips it — and `m2 := id(m)` (generic identity) degrades the
+            // result to `Unknown` through the type parameter, so even a map
+            // argument escapes the alias recorder. The checker has no
+            // interprocedural summary to prove the return is fresh (#38's
+            // argument), so edge the result to every may-share argument
+            // binding (and the method receiver, when present) whenever the
+            // result itself could share GC storage: may-share-capable or
+            // unresolvable. A concrete scalar/string result is a copy-out
+            // (no edge); a reference-shaped result is ALSO recorded as a
+            // binding alias by `record_alias` — both mechanisms agree on
+            // the freeze, matching what `m2 := m` records for the lexical
+            // form. `move`-wrapped arguments transfer ownership into the
+            // callee and are skipped.
+            Expr::Call { callee, args, .. } => {
+                let result = self.shape_of_expr(st, unwrap_parens(value));
+                if self.shape_may_share(&result) || matches!(result, TypeShape::Unknown) {
+                    let mut roots: Vec<&str> = Vec::new();
+                    for a in args {
+                        if matches!(unwrap_parens(&a.value), Expr::Move { .. }) {
+                            continue;
+                        }
+                        if let Some(root) = a.value.root_ident() {
+                            roots.push(root);
+                        }
+                    }
+                    // `x := r.method(...)` — the receiver is the callee's
+                    // base, not a call argument; a method that returns an
+                    // interior reference aliases it just like an argument.
+                    if let Expr::Field { base, .. } = unwrap_parens(callee) {
+                        if let Some(root) = base.root_ident() {
+                            roots.push(root);
+                        }
+                    }
+                    for root in roots {
+                        if root == name {
+                            continue;
+                        }
+                        if self.binding_may_share(st, root) {
+                            st.share_edge(name, root);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     /// Recursively collect live reference bindings embedded in a composite
     /// literal and link them (may-share) to the freshly bound `name`.
+    /// Projections (pr-28's case): a literal field value like `h1.m` shares
+    /// the root's mutable storage just as much as a bare `h1` — the
+    /// recursion must look through Field/Index/Slice to the root ident.
     fn record_literal_ref(&self, st: &mut FnState, name: &str, e: &Expr) {
         match unwrap_parens(e) {
             Expr::Ident { name: src, .. } => {
                 if self.binding_may_share(st, src) {
                     st.share_edge(name, src);
+                }
+            }
+            // `holder{m: h1.m}` / `xs{a: s1[:]}` — the embedded projection
+            // aliases the root binding's storage (pr-28, still-accepting
+            // repro `h2 := holder{m: h1.m}` after the pr-35 seam).
+            Expr::Slice { base, .. } => {
+                if let Some(root) = unwrap_parens(base).root_ident() {
+                    if self.binding_may_share(st, root) {
+                        st.share_edge(name, root);
+                    }
+                }
+            }
+            Expr::Field { .. } | Expr::Index { .. } => {
+                if self.shape_may_share(&self.shape_of_expr(st, unwrap_parens(e))) {
+                    if let Some(root) = e.root_ident() {
+                        if self.binding_may_share(st, root) {
+                            st.share_edge(name, root);
+                        }
+                    }
                 }
             }
             Expr::StructLit { fields, .. } => {
@@ -542,6 +618,57 @@ impl<'a> Checker<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Record O5.2 alias links for pointer borrows (`p := &stats`, `slot := &m[k]`)
+    /// so moving `p` freezes the underlying mutable binding `stats` (#33).
+    pub(crate) fn record_local_borrow_aliases(&self, st: &mut FnState, l: &LocalDecl) {
+        if l.names.len() == l.values.len() {
+            for (name, value) in l.names.iter().zip(l.values.iter()) {
+                if move_operand_ident(value).is_none() {
+                    if let Some(op) = as_addr_of(unwrap_parens(value)) {
+                        if let Some(src) = op.root_ident() {
+                            if src != name {
+                                if let Some(b) = self.lookup_binding(st, src) {
+                                    if !b.shape.is_sendable_by_type() {
+                                        st.aliases.insert(name.clone(), src.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record O5.2 alias links for pointer-borrow rebinds (`p = &stats`).
+    pub(crate) fn record_assign_borrow_aliases(
+        &self,
+        st: &mut FnState,
+        targets: &[Place],
+        op: AssignOp,
+        values: &[Expr],
+    ) {
+        if op == AssignOp::Assign && values.len() == targets.len() {
+            for (t, v) in targets.iter().zip(values.iter()) {
+                if let PlaceKind::Ident(name) = &t.kind {
+                    if move_operand_ident(v).is_none() {
+                        if let Some(addr_op) = as_addr_of(unwrap_parens(v)) {
+                            if let Some(src) = addr_op.root_ident() {
+                                if src != name {
+                                    if let Some(b) = self.lookup_binding(st, src) {
+                                        if !b.shape.is_sendable_by_type() {
+                                            st.aliases.insert(name.clone(), src.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -703,6 +830,10 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
+            // N1 for composite literals: a rebind whose RHS is a literal
+            // with nested nils (`j = jobT{m: nil}`) carries its own type
+            // context (HYB-E4001).
+            self.check_composite_nils(st, v);
         }
 
         // whole-binding rebind: `rows = append(rows, ...)`, parallel
@@ -854,6 +985,10 @@ impl<'a> Checker<'a> {
             }
         }
         for v in values {
+            // N1 for composite literals: a returned literal with nested
+            // nils (`return jobT{m: nil}`) carries its own type context
+            // (HYB-E4001).
+            self.check_composite_nils(st, v);
             // O2/LOAN-ESCAPE: a borrow returned from a function
             if as_addr_of(v).is_some() || contains_addr_of_in_literal(v) {
                 let msg = "a borrow cannot be returned from a function".to_string();

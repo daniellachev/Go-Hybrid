@@ -239,6 +239,16 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
     let flat = walk::flatten(body);
     st.last_use = flat.last_use.clone();
 
+    let mut active_loops: Vec<(
+        usize,
+        usize,
+        usize,
+        &hy_syntax::Block,
+        std::collections::HashSet<String>,
+    )> = Vec::new();
+    let mut reported_backedge: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // Pass B: statements in source order.
     for (stmt, idx) in &flat.stmts {
         let stmt: &Stmt = stmt;
@@ -269,6 +279,17 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                     }
                 }
             }
+        }
+        if let Stmt::For { body: lbody, .. } = stmt {
+            let outer_depth = st.scopes.len().saturating_sub(1);
+            let pre_moved = st
+                .env
+                .iter()
+                .chain(st.scopes.iter().flat_map(|s| s.iter()))
+                .filter(|(_, b)| b.moved.is_some())
+                .map(|(k, _)| k.clone())
+                .collect();
+            active_loops.push((idx, flat.loop_end_of(idx), outer_depth, lbody, pre_moved));
         }
         if let Stmt::Managed {
             reason,
@@ -359,7 +380,10 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
 
         // Statement-specific processing.
         match stmt {
-            Stmt::Local(l) => ck.process_local(&mut st, l, idx, managed),
+            Stmt::Local(l) => {
+                ck.process_local(&mut st, l, idx, managed);
+                ck.record_local_borrow_aliases(&mut st, l);
+            }
 
             Stmt::Assign {
                 targets,
@@ -368,6 +392,7 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 span,
             } => {
                 ck.process_assign(&mut st, targets, *op, values, *span, idx);
+                ck.record_assign_borrow_aliases(&mut st, targets, *op, values);
             }
 
             Stmt::Return { values, .. } => ck.process_return(&mut st, values),
@@ -402,28 +427,32 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 is_move,
                 span,
             } => {
-                let desc = if *is_move {
-                    format!(
-                        "the move-send `{} <- move {}`",
-                        chan.render(),
-                        value.render()
-                    )
-                } else {
-                    format!("the send `{} <- {}`", chan.render(), value.render())
-                };
-                let vals: Vec<&Expr> = vec![value];
-                let targets = ck.chan_elem_shape(&st, chan);
-                ck.check_site(
-                    &mut st,
-                    *span,
-                    "HYB-E3002",
-                    &vals,
-                    managed,
-                    &desc,
-                    *is_move,
-                    None,
-                    targets.as_deref(),
-                );
+                // Target classification (#77) runs FIRST: a non-channel (or
+                // unresolvable) send target is ill-typed — no value cascade.
+                if ck.check_send_target(&st, chan, *span) {
+                    let desc = if *is_move {
+                        format!(
+                            "the move-send `{} <- move {}`",
+                            chan.render(),
+                            value.render()
+                        )
+                    } else {
+                        format!("the send `{} <- {}`", chan.render(), value.render())
+                    };
+                    let vals: Vec<&Expr> = vec![value];
+                    let targets = ck.chan_elem_shape(&st, chan);
+                    ck.check_site(
+                        &mut st,
+                        *span,
+                        "HYB-E3002",
+                        &vals,
+                        managed,
+                        &desc,
+                        *is_move,
+                        None,
+                        targets.as_deref(),
+                    );
+                }
             }
 
             // Loop variables: fresh bindings per iteration shape.
@@ -465,25 +494,27 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
                 for arm in arms {
                     match &arm.kind {
                         SelectArmKind::Send { chan, value } => {
-                            let desc = format!(
-                                "the select-send `{} <- {}`",
-                                chan.render(),
-                                value.render()
-                            );
                             let span = chan.span().to(value.span());
-                            let vals: Vec<&Expr> = vec![value];
-                            let targets = ck.chan_elem_shape(&st, chan);
-                            ck.check_site(
-                                &mut st,
-                                span,
-                                "HYB-E3002",
-                                &vals,
-                                managed,
-                                &desc,
-                                false,
-                                None,
-                                targets.as_deref(),
-                            );
+                            if ck.check_send_target(&st, chan, span) {
+                                let desc = format!(
+                                    "the select-send `{} <- {}`",
+                                    chan.render(),
+                                    value.render()
+                                );
+                                let vals: Vec<&Expr> = vec![value];
+                                let targets = ck.chan_elem_shape(&st, chan);
+                                ck.check_site(
+                                    &mut st,
+                                    span,
+                                    "HYB-E3002",
+                                    &vals,
+                                    managed,
+                                    &desc,
+                                    false,
+                                    None,
+                                    targets.as_deref(),
+                                );
+                            }
                         }
                         SelectArmKind::Recv { .. } | SelectArmKind::Default => {}
                     }
@@ -495,13 +526,30 @@ fn check_fn(ck: &mut Checker<'_>, f: &FnDecl) {
             // and the uses/calls collected above.
             _ => {}
         }
+
+        while let Some((_, loop_end, _, _, _)) = active_loops.last() {
+            if *loop_end != idx {
+                break;
+            }
+            let (for_idx, loop_end, outer_depth, lbody, pre_moved) = active_loops.pop().unwrap();
+            ck.check_loop_backedge(
+                &st,
+                outer_depth,
+                &flat.stmts[for_idx..=loop_end],
+                lbody,
+                &pre_moved,
+                &mut reported_backedge,
+            );
+        }
     }
 
     // All remaining block scopes die at the end of the function (issue #14):
     // the closure pass's capture view is the COMPLETED base env (A5) — a
     // capture of a block-local now resolves to nothing and fails closed
     // (HYB-E3005) at the boundary, exactly like any unresolvable name.
-    st.scopes.clear();
+    while !st.scopes.is_empty() {
+        st.scope_pop();
+    }
 
     // Closure-boundary pass (closures.rs): task/send/select-send STATEMENTS
     // inside closure bodies are concurrency boundaries in the emitted Go —
@@ -536,6 +584,553 @@ mod tests {
         let r = check("fn main() { x := 1 \n fmt.println(x) }");
         assert_eq!(r.verdict, Verdict::Accept);
         assert!(r.diagnostics.is_empty(), "{:?}", r.diagnostics);
+    }
+
+
+    #[test]
+    fn shadow_scope_does_not_wipe_outer_alias_e3003() {
+        // An inner block shadowing `m2 := 1` must not wipe the outer alias
+        // `m2 -> m`: moving `m` after the block (or inside the block) must
+        // still freeze outer `m2` (HYB-E3003).
+        let r_after = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               m2 := m\n\
+               if true {\n\
+                 m2 := 1\n\
+                 fmt.println(m2)\n\
+               }\n\
+               done := make(chan bool, 1)\n\
+               task worker(move m, done)\n\
+               m2[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_after.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_after.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_after).as_deref(), Some("A1b"));
+        assert!(r_after.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        let r_inside = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               m2 := m\n\
+               done := make(chan bool, 1)\n\
+               if true {\n\
+                 m2 := 1\n\
+                 fmt.println(m2)\n\
+                 task worker(move m, done)\n\
+               }\n\
+               m2[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_inside.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_inside.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_inside).as_deref(), Some("A1b"));
+        assert!(r_inside.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+    }
+
+    #[test]
+    fn mutual_alias_rebind_cycle_still_freezes_on_move_e3003() {
+        // `m2 := m; m = m2` used to create a 2-cycle `m <-> m2` where 16
+        // hops of `resolve_alias` resolved `"m"` to `"m"` and `"m2"` to `"m2"`,
+        // leaving `m2` unfrozen after `move m`.
+        let r = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               m2 := m\n\
+               m = m2\n\
+               done := make(chan bool, 1)\n\
+               task worker(move m, done)\n\
+               m2[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(first_error_rule(&r).as_deref(), Some("A1b"));
+        assert!(r.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+    }
+
+    #[test]
+    fn same_statement_double_move_and_move_plus_read_reject_e3003() {
+        // Moving the same binding (or its alias) twice in one statement, or
+        // moving and reading it in the same multi-define, must reject with HYB-E3003.
+        let r_spawn = check(
+            "fn both(a map[string]int, b map[string]int) { a[\"k\"] = 1\n b[\"k\"] = 2 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               task both(move m, move m)\n\
+             }",
+        );
+        assert_eq!(
+            r_spawn.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_spawn.diagnostics
+        );
+        assert!(r_spawn.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        let r_multi = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               a, b := move m, move m\n\
+               done := make(chan bool, 1)\n\
+               task worker(move a, done)\n\
+               b[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_multi.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_multi.diagnostics
+        );
+        assert!(r_multi.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        let r_move_and_read = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               a, b := move m, m\n\
+               done := make(chan bool, 1)\n\
+               task worker(move a, done)\n\
+               b[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_move_and_read.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_move_and_read.diagnostics
+        );
+        assert!(r_move_and_read
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3003"));
+
+        // Shadowing the outer root `m` (`m := 1`) inside a block before moving
+        // an alias `m2` of the outer `m` must still freeze the outer `m`.
+        let r_shadow_root = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 1)\n\
+               if true {\n\
+                 m2 := m\n\
+                 m := 1\n\
+                 task worker(move m2, done)\n\
+                 _ = m\n\
+               }\n\
+               m[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_shadow_root.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_shadow_root.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_shadow_root).as_deref(), Some("A1b"));
+    }
+
+    #[test]
+    fn o52_struct_and_array_carrying_reference_fields_freeze_aliases_on_move() {
+        // Shallow copy of a struct carrying a map shares the underlying map header;
+        // moving h1 must freeze h2 (issue #27).
+        let r_struct = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder) { h.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               h1 := holder{m: map[string]int{\"k\": 0}}\n\
+               h2 := h1\n\
+               task worker(move h1)\n\
+               h2.m[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_struct.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_struct.diagnostics
+        );
+        // the alias-freeze E3003 carries no tier0_rule on the current seam
+        // (only consumed moves stamp A7) — the code is the stable contract
+        assert!(r_struct.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // Positive control: a pure value struct (no reference fields) is deep-copied
+        // by value in Go, so copying before `move` stays legal.
+        let r_value_struct = check(
+            "struct point { x int\n y int }\n\
+             fn worker(p point) { fmt.println(p.x) }\n\
+             fn main() {\n\
+               p1 := point{x: 1, y: 2}\n\
+               p2 := p1\n\
+               task worker(move p1)\n\
+               fmt.println(p2.y)\n\
+             }",
+        );
+        assert_eq!(
+            r_value_struct.verdict,
+            Verdict::Accept,
+            "{:?}",
+            r_value_struct.diagnostics
+        );
+    }
+
+    #[test]
+    fn o52_paren_slice_projection_and_composite_literal_aliases_freeze_on_move() {
+        // 1. Parenthesized alias: `m2 := (agg)`
+        let r_paren = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               agg := map[string]int{\"k\": 0}\n\
+               m2 := (agg)\n\
+               task worker(move agg)\n\
+               m2[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_paren.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_paren.diagnostics
+        );
+        assert!(r_paren.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // 2. Re-sliced alias: `s2 := s1[:]`
+        let r_slice = check(
+            "fn worker(s []int) { s[0] = 1 }\n\
+             fn main() {\n\
+               s1 := []int{0, 1}\n\
+               s2 := s1[:]\n\
+               task worker(move s1)\n\
+               s2[0] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_slice.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_slice.diagnostics
+        );
+        assert!(r_slice.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // 3. Field projection of reference type: `m2 := h1.m`
+        let r_proj = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder) { h.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               h1 := holder{m: map[string]int{\"k\": 0}}\n\
+               m2 := h1.m\n\
+               task worker(move h1)\n\
+               m2[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(r_proj.verdict, Verdict::Reject, "{:?}", r_proj.diagnostics);
+        assert!(r_proj.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // 4. Composite literal capturing a live mutable binding without `move`: `h := holder{m: agg}`
+        let r_comp = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder) { h.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               agg := map[string]int{\"k\": 0}\n\
+               h := holder{m: agg}\n\
+               task worker(move h)\n\
+               agg[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(r_comp.verdict, Verdict::Reject, "{:?}", r_comp.diagnostics);
+        assert!(r_comp.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // 5. Composite literal capturing a field projection (`holder{m: h1.m}`)
+        let r_comp_proj = check(
+            "struct holder { m map[string]int }\n\
+             fn worker(h holder) { h.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               h1 := holder{m: map[string]int{\"k\": 0}}\n\
+               h2 := holder{m: h1.m}\n\
+               task worker(move h2)\n\
+               h1.m[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_comp_proj.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_comp_proj.diagnostics
+        );
+        assert!(r_comp_proj
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3003"));
+    }
+
+    #[test]
+    fn composite_literal_nil_fields_reject_e4001() {
+        // PLAN follow-up (the audit's composite-nil row): classify_composite
+        // has no per-field type context, so `job{m: nil}` passed with 0
+        // diagnostics. The literal carries its own type context — the nil
+        // rejects as a TYPE error wherever the slot resolves.
+        // S1: the audit repro — spawn arg literal.
+        let r_spawn = check(
+            "struct job { m map[string]int }\n\
+             fn worker(j job) { j.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               j := job{m: nil}\n\
+               task worker(j)\n\
+             }",
+        );
+        assert_eq!(r_spawn.verdict, Verdict::Reject, "{:?}", r_spawn.diagnostics);
+        assert!(r_spawn.diagnostics.iter().any(|d| d.code == "HYB-E4001"));
+
+        // S2: a plain local define — no boundary involved.
+        let r_local = check(
+            "struct job { m map[string]int }\n\
+             fn main() {\n\
+               j := job{m: nil}\n\
+               fmt.println(j)\n\
+             }",
+        );
+        assert_eq!(r_local.verdict, Verdict::Reject, "{:?}", r_local.diagnostics);
+        assert!(r_local.diagnostics.iter().any(|d| d.code == "HYB-E4001"));
+
+        // S3: map literal value slot + slice element slot.
+        let r_map = check("fn main() {\n  mm := map[string][]int{\"k\": nil}\n  fmt.println(mm)\n}");
+        assert_eq!(r_map.verdict, Verdict::Reject, "{:?}", r_map.diagnostics);
+        assert!(r_map.diagnostics.iter().any(|d| d.code == "HYB-E4001"));
+
+        let r_slice = check("fn main() {\n  xs := []map[string]int{nil}\n  fmt.println(xs)\n}");
+        assert_eq!(r_slice.verdict, Verdict::Reject, "{:?}", r_slice.diagnostics);
+        assert!(r_slice.diagnostics.iter().any(|d| d.code == "HYB-E4001"));
+
+        // S4: the managed hatch does NOT suppress a type contract.
+        let r_managed = check(
+            "struct job { m map[string]int }\n\
+             fn worker(j job) { j.m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               managed(\"the job is rebuilt inside the worker\", \"actor\") {\n\
+                 task worker(job{m: nil})\n\
+               }\n\
+             }",
+        );
+        assert_eq!(
+            r_managed.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_managed.diagnostics
+        );
+        assert!(r_managed
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E4001"));
+
+        // Nested literals reject too.
+        let r_nested = check(
+            "struct job { m map[string]int }\n\
+             struct wrap { j job }\n\
+             fn main() {\n\
+               w := wrap{j: job{m: nil}}\n\
+               fmt.println(w)\n\
+             }",
+        );
+        assert_eq!(r_nested.verdict, Verdict::Reject, "{:?}", r_nested.diagnostics);
+        assert!(r_nested.diagnostics.iter().any(|d| d.code == "HYB-E4001"));
+
+        // Positive control: a real map value stays legal; error-typed nil
+        // stays legal (N2).
+        let r_ok = check(
+            "struct job { m map[string]int }\n\
+             fn main() {\n\
+               j := job{m: map[string]int{}}\n\
+               fmt.println(j)\n\
+             }",
+        );
+        assert_eq!(r_ok.verdict, Verdict::Accept, "{:?}", r_ok.diagnostics);
+    }
+
+    #[test]
+    fn closure_boundary_rejects_outer_or_closure_moved_binding_e3003() {
+        // Issue #29: outer binding `m` is moved in `main`, and closure `f`
+        // spawns a task with `m` — must not silently pass via `b.moved.is_some() => Ok`.
+        let r_outer = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 2)\n\
+               f := fn() {\n\
+                 task worker(m, done)\n\
+               }\n\
+               task worker(move m, done)\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(
+            r_outer.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_outer.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_outer).as_deref(), Some("A1b"));
+        assert!(r_outer.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // Closure-local binding moved once then shared/moved again at a second
+        // boundary inside the same closure must also reject with HYB-E3003.
+        let r_inner = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               done := make(chan bool, 2)\n\
+               f := fn() {\n\
+                 m := map[string]int{\"k\": 0}\n\
+                 task worker(move m, done)\n\
+                 task worker(m, done)\n\
+               }\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(
+            r_inner.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_inner.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_inner).as_deref(), Some("A1b"));
+        assert!(r_inner.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+
+        // Moving a captured outer binding inside a closure (`task worker(move m)`)
+        // must also reject with HYB-E3003 / HYB-E3004 (A1b) because closures can
+        // run multiple times or concurrently with the enclosing scope.
+        let r_capture_move = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 2)\n\
+               f := fn() {\n\
+                 task worker(move m, done)\n\
+               }\n\
+               f()\n\
+               m[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(
+            r_capture_move.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_capture_move.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_capture_move).as_deref(), Some("A1b"));
+        assert!(r_capture_move
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "HYB-E3003" || d.code == "HYB-E3004"));
+
+        // Using/mutating a closure-local binding after moving it inside the
+        // closure must reject with HYB-E3003 even when the use is a non-boundary
+        // statement (`m["k"] = 2`).
+        let r_inner_assign = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               done := make(chan bool, 1)\n\
+               f := fn() {\n\
+                 m := map[string]int{\"k\": 0}\n\
+                 task worker(move m, done)\n\
+                 m[\"k\"] = 2\n\
+               }\n\
+               f()\n\
+             }",
+        );
+        assert_eq!(
+            r_inner_assign.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_inner_assign.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_inner_assign).as_deref(), Some("A1b"));
+
+        // A closure defined inside a `select` arm body must still be collected
+        // and checked by the closure boundary pass.
+        let r_select_closure = check(
+            "fn worker(m map[string]int, done chan<- bool) { m[\"k\"] = 1\n done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 1)\n\
+               select {\n\
+               v, ok := <-done: {\n\
+                   f := fn() {\n\
+                     task worker(m, done)\n\
+                   }\n\
+                   f()\n\
+                 }\n\
+               }\n\
+             }",
+        );
+        assert_eq!(
+            r_select_closure.verdict,
+            Verdict::Reject,
+            "{:?}",
+            r_select_closure.diagnostics
+        );
+        assert_eq!(first_error_rule(&r_select_closure).as_deref(), Some("A1c"));
+    }
+
+    #[test]
+    fn move_cannot_launder_closure_borrow_handle_or_unknown_at_boundary() {
+        let r_closure = check(
+            "fn run(f fn()) { f() }\n\
+             fn main() {\n\
+               m := map[string]int{}\n\
+               f := fn() { m[\"k\"] = 1 }\n\
+               task run(move f)\n\
+               m[\"k\"] = 2\n\
+             }",
+        );
+        assert_eq!(r_closure.verdict, Verdict::Reject);
+        assert_eq!(first_error_rule(&r_closure).as_deref(), Some("A1c"));
+
+        let r_ptr = check(
+            "struct st { n int }\n\
+             fn take(r *st) {}\n\
+             fn main() {\n\
+               x := st{}\n\
+               r := &x\n\
+               task take(move r)\n\
+               x.n = 2\n\
+             }",
+        );
+        assert_eq!(r_ptr.verdict, Verdict::Reject);
+        assert_eq!(first_error_rule(&r_ptr).as_deref(), Some("A1b"));
+
+        let r_borrow = check(
+            "import \"rust/serde_json\"\n\
+             fn send_val(v any) {}\n\
+             fn main() {\n\
+               doc := serde_json.parse(`{}`)?\n\
+               v := doc.get(\"k\")?\n\
+               task send_val(move v)\n\
+               doc.set(\"k\", 1)?\n\
+             }",
+        );
+        assert_eq!(r_borrow.verdict, Verdict::Reject);
+
+        let r_unknown = check(
+            "fn send_val(v any) {}\n\
+             fn main() {\n\
+               u := mystery_factory()\n\
+               task send_val(move u)\n\
+             }",
+        );
+        assert_eq!(r_unknown.verdict, Verdict::Reject);
+        assert_eq!(first_error_rule(&r_unknown).as_deref(), Some("FC"));
     }
 
     #[test]
@@ -1379,6 +1974,74 @@ mod tests {
         );
         assert_eq!(r2.verdict, Verdict::Reject, "{:?}", r2.diagnostics);
         assert!(r2.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+    }
+
+    #[test]
+    fn o51_move_inside_loop_of_outer_binding_rejects_e3003() {
+        let r = check(
+            "fn worker(m map[string]int, done chan<- bool) {\n\
+               for i in 0..10 { m[\"k\"] = i }\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 2)\n\
+               for i in 0..2 {\n\
+                 task worker(move m, done)\n\
+               }\n\
+               <-done\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(first_error_rule(&r).as_deref(), Some("A1b"));
+        let d = &r.diagnostics[0];
+        assert_eq!(d.code, "HYB-E3003");
+        assert!(d.message.contains("moved again"), "{}", d.message);
+    }
+
+    #[test]
+    fn o52_use_before_move_inside_loop_rejects_on_backedge() {
+        let r = check(
+            "fn worker(m map[string]int, done chan<- bool) { done <- true }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               done := make(chan bool, 2)\n\
+               for i in 0..2 {\n\
+                 m[\"k\"] = i\n\
+                 task worker(move m, done)\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r.verdict, Verdict::Reject, "{:?}", r.diagnostics);
+        assert_eq!(first_error_rule(&r).as_deref(), Some("A1b"));
+        assert!(r.diagnostics.iter().any(|d| d.code == "HYB-E3003"));
+    }
+
+    #[test]
+    fn o51_fresh_binding_inside_loop_and_move_then_break_accept() {
+        let r_fresh = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               for i in 0..2 {\n\
+                 chunk := map[string]int{\"k\": i}\n\
+                 task worker(move chunk)\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r_fresh.verdict, Verdict::Accept, "{:?}", r_fresh.diagnostics);
+
+        let r_break = check(
+            "fn worker(m map[string]int) { m[\"k\"] = 1 }\n\
+             fn main() {\n\
+               m := map[string]int{\"k\": 0}\n\
+               for i in 0..2 {\n\
+                 task worker(move m)\n\
+                 break\n\
+               }\n\
+             }",
+        );
+        assert_eq!(r_break.verdict, Verdict::Accept, "{:?}", r_break.diagnostics);
     }
 
     // -----------------------------------------------------------------------

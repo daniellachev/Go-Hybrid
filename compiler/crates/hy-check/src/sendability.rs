@@ -78,9 +78,60 @@ impl<'a> Checker<'a> {
     // Classification
     // -----------------------------------------------------------------------
 
+    fn classify_move_ident(&self, st: &FnState, name: &str) -> Outcome {
+        let Some(b) = self.lookup_binding(st, name) else {
+            // Unresolved move operand is already recorded by the move-operand pass.
+            return Outcome::Ok;
+        };
+        if b.moved.is_some() {
+            return Outcome::Ok;
+        }
+        if b.managed_taint {
+            return Outcome::Managed {
+                desc: self.managed_desc(name, b),
+                risky: !b.shape.is_sendable_by_type(),
+            };
+        }
+        match &b.shape {
+            TypeShape::Unknown => Outcome::Unproven(UnprovenInfo {
+                value: name.to_string(),
+                reason: "its type did not resolve to a sendability class (no ascription and the initializer's type was unresolvable)".to_string(),
+            }),
+            TypeShape::Closure => Outcome::Rejected(RejectInfo {
+                value: name.to_string(),
+                ty: self.binding_ty_str(b),
+                notes: vec![
+                    "closures capture their environment by reference; moving a closure binding does not move or freeze its captured state, so closures are not sendable at spawn/send sites in Tier 0 (A5 perimeter)".to_string(),
+                ],
+            }),
+            TypeShape::BorrowHandle(_) => Outcome::Rejected(RejectInfo {
+                value: name.to_string(),
+                ty: self.binding_ty_str(b),
+                notes: vec![format!(
+                    "`{}` is a borrow handle (element view) — borrow loans are function-local and cannot be moved across tasks (O2/O7/O11); only own-handles transfer via `move`",
+                    name
+                )],
+            }),
+            TypeShape::ForeignOpaque(_) => Outcome::Rejected(RejectInfo {
+                value: name.to_string(),
+                ty: self.binding_ty_str(b),
+                notes: vec![format!(
+                    "`{}` is an opaque foreign value ({}) — foreign runtime/synchronization types cannot be moved across tasks (O4/A5)",
+                    name,
+                    self.binding_ty_str(b)
+                )],
+            }),
+            _ => Outcome::Ok,
+        }
+    }
+
     pub(crate) fn classify_value(&self, st: &FnState, expr: &Expr) -> Outcome {
-        // `move x` — class 3; the transfer marking + O5.4 validation happens at the site.
-        if matches!(unwrap_parens(expr), Expr::Move { .. }) {
+        // `move x` — class 3; validate that `x` resolves to a movable shape
+        // (never Unknown, Closure, BorrowHandle, or ForeignOpaque).
+        if let Expr::Move { operand, .. } = unwrap_parens(expr) {
+            if let Expr::Ident { name, .. } = unwrap_parens(operand) {
+                return self.classify_move_ident(st, name);
+            }
             return Outcome::Ok;
         }
         // literals and interpolated strings
@@ -466,6 +517,53 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Classify a send's TARGET (#77): a send is only well-typed when the
+    /// channel expression resolves to a channel shape. Before this check a
+    /// deliberate `noop() <- 1` (void call as target) and the accidental
+    /// newline fusion `noop()` / `<-done` (parser) both passed with 0
+    /// diagnostics and emitted Go that failed `go build` — breaking the
+    /// accepted-should-emit-buildable-Go contract. A concrete non-channel
+    /// is HYB-E3007; an unresolvable shape is fail-closed HYB-E3005
+    /// (O4.9). Like E3004/E3006, an ill-typed TARGET is not a sendability
+    /// doubt — `managed` does not suppress it. Returns true when the
+    /// target is a channel (callers then run the value check-site as
+    /// usual); false emits the diagnostic and the caller skips the value
+    /// check (the site is ill-typed — no cascade).
+    pub(crate) fn check_send_target(&mut self, st: &FnState, chan: &Expr, span: Span) -> bool {
+        match self.shape_of_expr(st, chan) {
+            TypeShape::Chan(_) => true,
+            TypeShape::Unknown => {
+                let msg = format!(
+                    "cannot prove `{}` is a channel — a send target must resolve to `chan T` (O4.9)",
+                    chan.render()
+                );
+                let notes = vec![
+                    "why: the checker cannot classify the send target's type, and a send to a non-channel is not valid Go (issue #77)".to_string(),
+                    "fix: bind the channel to a local (or parameter) with a visible `chan T` type before sending, so the checker can resolve it".to_string(),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E3005", self.path.clone(), span, msg).with_notes(notes),
+                );
+                false
+            }
+            other => {
+                let msg = format!(
+                    "cannot send to `{}` ({}) — a send target must be a channel (O4)",
+                    chan.render(),
+                    other.render()
+                );
+                let notes = vec![
+                    "why: `<-` on a non-channel value is not valid Go; the accepted subset only emits buildable Go (issue #77)".to_string(),
+                    "fix: send to a `chan T` binding (`ch := make(chan T, n)` or a `chan T` parameter); note that a statement STARTING with `<-expr` is a RECEIVE — a `<-` on a new line never continues the previous statement".to_string(),
+                ];
+                self.diags.push(
+                    Diagnostic::error("HYB-E3007", self.path.clone(), span, msg).with_notes(notes),
+                );
+                false
+            }
+        }
+    }
+
     /// Emit HYB-E4001: `nil` flowing into a known non-nilable type (rule N1).
     /// `what` names the target in the message ("the assignment target `m`",
     /// "a parameter of the spawn callee", ...). A TYPE contract, not a
@@ -503,6 +601,95 @@ impl<'a> Checker<'a> {
         notes.push("if absence is the meaning, use `option[T]` — its zero value is `none` (N3)".to_string());
         self.diags
             .push(Diagnostic::error("HYB-E4001", self.path.clone(), span, msg).with_notes(notes));
+    }
+
+    /// N1 for composite literals: `job{m: nil}` with a map-typed field used
+    /// to pass the checker — classify_composite has no per-field type
+    /// context, so the bare-nil check at the five direct-flow sites never
+    /// saw the nested `nil`. The fix follows the N1 doctrine (a TYPE
+    /// contract, emitted even inside `managed`): every literal carries its
+    /// own type context (the struct def, the map's value type, the slice's
+    /// element type), so a `nil` whose slot resolves to a non-nilable shape
+    /// is a type error right there — boundary or not.
+    pub(crate) fn check_composite_nils(&mut self, st: &FnState, value: &Expr) {
+        match unwrap_parens(value) {
+            Expr::StructLit { ty, fields, .. } => {
+                // the literal's own ascription wins; else infer from the env
+                // (an ascribed define `var j jobT = jobT{...}` names the
+                // struct twice — same answer)
+                let sname = ty.as_ref().and_then(|t| match t {
+                    hy_syntax::TypeExpr::Named { name, .. } => Some(name.clone()),
+                    _ => None,
+                });
+                if let Some(sname) = sname.or_else(|| {
+                    let shape = self.shape_of_expr(st, value);
+                    match shape {
+                        TypeShape::Struct(Some(n)) => Some(n),
+                        _ => None,
+                    }
+                }) {
+                    if let Some(def) = self.structs.get(&sname).cloned() {
+                        for f in fields {
+                            if let Some((_, fty)) = def.iter().find(|(n, _)| n == &f.name) {
+                                if Checker::is_nil_literal(&f.value) {
+                                    let fshape = self.shape_of_type(fty);
+                                    if !Checker::is_nilable_shape(&fshape) {
+                                        self.emit_nil_type_error_text(
+                                            &fshape,
+                                            fty.render(),
+                                            f.value.span(),
+                                            &format!("the field `{}.{}`", sname, f.name),
+                                        );
+                                    }
+                                    continue;
+                                }
+                                self.check_composite_nils(st, &f.value);
+                            }
+                        }
+                    }
+                }
+            }
+            Expr::MapLit { value: vty, entries, .. } => {
+                let vshape = self.shape_of_type(vty);
+                let vty_text = vty.render();
+                for (k, v) in entries {
+                    if Checker::is_nil_literal(v) && !Checker::is_nilable_shape(&vshape) {
+                        self.emit_nil_type_error_text(
+                            &vshape,
+                            vty_text.clone(),
+                            v.span(),
+                            &format!("the map value slot `{}`", vty_text),
+                        );
+                        continue;
+                    }
+                    self.check_composite_nils(st, v);
+                    self.check_composite_nils(st, k);
+                }
+            }
+            Expr::SliceLit { elem, items, .. } => {
+                if let Some(ety) = elem {
+                    let eshape = self.shape_of_type(ety);
+                    let ety_text = ety.render();
+                    for it in items {
+                        if Checker::is_nil_literal(it) && !Checker::is_nilable_shape(&eshape) {
+                            self.emit_nil_type_error_text(
+                                &eshape,
+                                ety_text.clone(),
+                                it.span(),
+                                &format!("the element slot `{}`", ety_text),
+                            );
+                            continue;
+                        }
+                        self.check_composite_nils(st, it);
+                    }
+                } else {
+                    for it in items {
+                        self.check_composite_nils(st, it);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -560,6 +747,10 @@ impl<'a> Checker<'a> {
         }
 
         for (vi, v) in values.iter().enumerate() {
+            // N1 for composite literals: a literal that crosses the boundary
+            // with nested nils (`task worker(jobT{m: nil})`) is a TYPE error
+            // at its own slot — emitted even inside `managed` (HYB-E4001).
+            self.check_composite_nils(st, v);
             // N1 (rule N): a bare `nil` is not a classifiable sendability
             // value — it either lands on a type that HAS a nil (error,
             // foreign; N2) or it is a type error (HYB-E4001). With no
@@ -599,6 +790,18 @@ impl<'a> Checker<'a> {
                 } else if !managed {
                     self.check_o54_non_ident_move(st, op, v.span());
                 }
+                if let Expr::Ident { name, .. } = op {
+                    match self.classify_move_ident(st, name) {
+                        Outcome::Ok => {}
+                        Outcome::Managed { desc, risky } => {
+                            if risky {
+                                managed_descs.push(desc);
+                            }
+                        }
+                        Outcome::Rejected(info) => rejects.push(info),
+                        Outcome::Unproven(info) => unprovens.push(info),
+                    }
+                }
                 continue;
             }
 
@@ -620,10 +823,6 @@ impl<'a> Checker<'a> {
                 } else if !managed {
                     self.check_o54_non_ident_move(st, op, mspan);
                 }
-            }
-
-            if matches!(crate::model::unwrap_parens(v), Expr::Move { .. }) {
-                continue;
             }
 
             match self.classify_value(st, v) {
